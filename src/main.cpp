@@ -1382,14 +1382,8 @@ bool CTransaction::CheckInputs(CCoinsViewCache &inputs, enum CheckSig_mode csmod
                 const CCoins &coins = inputs.GetCoins(prevout.hash);
 
                 // Verify signature
-                if (!VerifySignature(coins, *this, i, fStrictPayToScriptHash, fStrictEncodings, 0)) {
-                    // only during transition phase for P2SH: do not invoke anti-DoS code for
-                    // potentially old clients relaying bad P2SH transactions
-                    if (fStrictPayToScriptHash && VerifySignature(coins, *this, i, false, fStrictEncodings, 0))
-                        return error("CheckInputs() : %s P2SH VerifySignature failed", GetHash().ToString().substr(0,10).c_str());
-
+                if (!VerifySignature(coins, *this, i, fStrictPayToScriptHash, fStrictEncodings, 0))
                     return DoS(100,error("CheckInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,10).c_str()));
-                }
             }
         }
     }
@@ -1558,7 +1552,8 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, CCoinsViewCache &view, bool fJust
     // Now that the whole chain is irreversibly beyond that time it is applied to all blocks except the
     // two in the chain that violate it. This prevents exploiting the issue against nodes in their
     // initial block download.
-    bool fEnforceBIP30 = !((pindex->nHeight==91842 && pindex->GetBlockHash() == uint256("0x00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")) ||
+    bool fEnforceBIP30 = (!pindex->phashBlock) || // Enforce on CreateNewBlock invocations which don't have a hash.
+                          !((pindex->nHeight==91842 && pindex->GetBlockHash() == uint256("0x00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")) ||
                            (pindex->nHeight==91880 && pindex->GetBlockHash() == uint256("0x00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")));
     if (fEnforceBIP30) {
         for (unsigned int i=0; i<vtx.size(); i++) {
@@ -2617,8 +2612,12 @@ string GetWarnings(string strFor)
     int nPriority = 0;
     string strStatusBar;
     string strRPC;
+
     if (GetBoolArg("-testsafemode"))
         strRPC = "test";
+
+    if (!CLIENT_VERSION_IS_RELEASE)
+        strStatusBar = _("This is a pre-release test build - use at your own risk - do not use for mining or merchant applications");
 
     // Misc warnings like out of disk space and clock is wrong
     if (strMiscWarning != "")
@@ -2702,7 +2701,6 @@ unsigned char pchMessageStart[4] = { 0xf9, 0xbe, 0xb4, 0xd9 };
 
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
-    static map<CService, CPubKey> mapReuseKey;
     RandAddSeedPerfmon();
     if (fDebug)
         printf("received: %s (%"PRIszu" bytes)\n", strCommand.c_str(), vRecv.size());
@@ -3210,53 +3208,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
-    else if (strCommand == "checkorder")
-    {
-        uint256 hashReply;
-        vRecv >> hashReply;
-
-        if (!GetBoolArg("-allowreceivebyip"))
-        {
-            pfrom->PushMessage("reply", hashReply, (int)2, string(""));
-            return true;
-        }
-
-        CWalletTx order;
-        vRecv >> order;
-
-        /// we have a chance to check the order here
-
-        // Keep giving the same key to the same ip until they use it
-        if (!mapReuseKey.count(pfrom->addr))
-            pwalletMain->GetKeyFromPool(mapReuseKey[pfrom->addr], true);
-
-        // Send back approval of order and pubkey to use
-        CScript scriptPubKey;
-        scriptPubKey << mapReuseKey[pfrom->addr] << OP_CHECKSIG;
-        pfrom->PushMessage("reply", hashReply, (int)0, scriptPubKey);
-    }
-
-
-    else if (strCommand == "reply")
-    {
-        uint256 hashReply;
-        vRecv >> hashReply;
-
-        CRequestTracker tracker;
-        {
-            LOCK(pfrom->cs_mapRequests);
-            map<uint256, CRequestTracker>::iterator mi = pfrom->mapRequests.find(hashReply);
-            if (mi != pfrom->mapRequests.end())
-            {
-                tracker = (*mi).second;
-                pfrom->mapRequests.erase(mi);
-            }
-        }
-        if (!tracker.IsNull())
-            tracker.fn(tracker.param1, vRecv);
-    }
-
-
     else if (strCommand == "ping")
     {
         if (pfrom->nVersion > BIP0031_VERSION)
@@ -3745,12 +3696,8 @@ public:
     }
 };
 
-const char* pszDummy = "\0\0";
-CScript scriptDummy(std::vector<unsigned char>(pszDummy, pszDummy + sizeof(pszDummy)));
-
 CBlock* CreateNewBlock(CReserveKey& reservekey)
 {
-    CBlockIndex* pindexPrev = pindexBest;
 
     // Create new block
     auto_ptr<CBlock> pblock(new CBlock());
@@ -3795,6 +3742,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey)
     int64 nFees = 0;
     {
         LOCK2(cs_main, mempool.cs);
+        CBlockIndex* pindexPrev = pindexBest;
         CCoinsViewCache view(*pcoinsTip, true);
 
         // Priority order to process transactions
@@ -3981,7 +3929,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey)
         pblock->UpdateTime(pindexPrev);
         pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock.get());
         pblock->nNonce         = 0;
-        pblock->vtx[0].vin[0].scriptSig = scriptDummy;
+        pblock->vtx[0].vin[0].scriptSig = CScript() << OP_0 << OP_0;
 
         CBlockIndex indexDummy(*pblock);
         indexDummy.pprev = pindexPrev;
